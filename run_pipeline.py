@@ -11,6 +11,9 @@ import sys
 import torch
 import numpy as np
 import warnings
+import csv
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 
 # ---------------- SILENCE ALL WARNINGS ----------------
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -24,89 +27,102 @@ warnings.filterwarnings("ignore")
 from transformers import logging
 logging.set_verbosity_error()
 
-# ---------------- ACTION ----------------
+# ---------------- IMPORTS ----------------
 from action_recognition.infer_action import run_action_recognition
 from action_recognition.cnn3d_model import generate_model
-
-# ---------------- ANOMALY ----------------
 from anomaly_detection.feature_extractor import VideoFeatureExtractor
 from anomaly_detection.infer_anomaly import AnomalyInferencer
-
-# ---------------- EXPLAINABILITY ----------------
 from explainability.gradcam_action import ActionGradCAM, save_gradcam_video
-from explainability.activation_maps import (
-    ActivationMapExplainer,
-    save_activation_video
-)
-
-# ---------------- CAPTIONING ----------------
-from captioning.caption_frames import (
-    SceneCaptioner,
-    save_captions
-)
+from explainability.activation_maps import ActivationMapExplainer, save_activation_video
+from captioning.caption_frames import SceneCaptioner, save_captions
 
 # ---------------- CONFIG ----------------
-VIDEO_PATH = r"data\videos\v_BoxingPunchingBag_g01_c03.avi"
-
 ACTION_MODEL_PATH = "action_recognition/best_3dcnn.pth"
 ANOMALY_MODEL_PATH = "anomaly_detection/best_anomaly_model.pth"
-
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# ----------------------------------------
 
 
-def select_keyframes(video_path, anomaly_scores, top_k=5):
-    """
-    Select keyframes based on anomaly peaks
-    """
-    cap = cv2.VideoCapture(video_path)
-    frames = []
+# ============================================================
+# EVENT BUILDER
+# ============================================================
+def build_timeline(anomaly_scores, fps, action_label, action_conf):
+    events = []
+    threshold = 0.6
+    active = None
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
+    for i, score in enumerate(anomaly_scores):
+        time_sec = i / fps
 
-    cap.release()
+        if score > threshold:
+            if active is None:
+                active = {
+                    "start": time_sec,
+                    "max_score": float(score)
+                }
+            else:
+                active["max_score"] = max(active["max_score"], float(score))
+        else:
+            if active:
+                active["end"] = time_sec
+                active["type"] = "Anomaly"
+                events.append(active)
+                active = None
 
-    if len(frames) == 0:
-        return []
+    # Add action event
+    events.append({
+        "start": 0,
+        "end": len(anomaly_scores)/fps,
+        "type": action_label,
+        "confidence": float(action_conf)
+    })
 
-    idxs = np.argsort(anomaly_scores)[-top_k:]
-    idxs = sorted(idxs)
-
-    keyframes = [frames[i] for i in idxs if i < len(frames)]
-    return keyframes
+    return events
 
 
-def main():
-    print("\n🚀 Starting Visionary Pipeline\n")
+# ============================================================
+# REPORT GENERATION
+# ============================================================
+def export_csv(events, path):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=events[0].keys())
+        writer.writeheader()
+        writer.writerows(events)
 
-    # =========================================================
-    # 1️⃣ ACTION RECOGNITION
-    # =========================================================
-    print("🔹 Running Action Recognition...")
+
+def export_pdf(report_data, path):
+    doc = SimpleDocTemplate(path)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    elements.append(Paragraph("Visionary AI Surveillance Report", styles["Title"]))
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph(report_data["caption"], styles["Normal"]))
+    elements.append(Spacer(1, 12))
+
+    for e in report_data["timeline"]:
+        text = f"{e['type']} event from {e['start']:.2f}s to {e['end']:.2f}s"
+        elements.append(Paragraph(text, styles["Normal"]))
+        elements.append(Spacer(1, 6))
+
+    doc.build(elements)
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+def main(VIDEO_PATH):
+
+    # 1️⃣ ACTION
     action_result = run_action_recognition(
         VIDEO_PATH,
         ACTION_MODEL_PATH
     )
 
-    print(f"   Action: {action_result['action']} "
-          f"({action_result['confidence']:.2f})")
-
-    # =========================================================
-    # 2️⃣ ANOMALY DETECTION
-    # =========================================================
-    print("\n🔹 Running Anomaly Detection...")
-
+    # 2️⃣ ANOMALY
     backbone = generate_model(num_classes=101)
-    backbone.load_state_dict(
-        torch.load(ACTION_MODEL_PATH, map_location=DEVICE)
-    )
+    backbone.load_state_dict(torch.load(ACTION_MODEL_PATH, map_location=DEVICE))
     backbone.eval()
 
     feature_extractor = VideoFeatureExtractor(backbone, device=DEVICE)
@@ -118,114 +134,81 @@ def main():
     features = feature_extractor.extract(VIDEO_PATH)
 
     total_frames = int(
-        cv2.VideoCapture(VIDEO_PATH)
-        .get(cv2.CAP_PROP_FRAME_COUNT)
+        cv2.VideoCapture(VIDEO_PATH).get(cv2.CAP_PROP_FRAME_COUNT)
     )
 
     anomaly_scores = anomaly_model.infer(features, total_frames)
-    np.save(os.path.join(OUTPUT_DIR, "anomaly_scores.npy"), anomaly_scores)
 
-    print(f"   Max anomaly score: {anomaly_scores.max():.4f}")
+    fps = cv2.VideoCapture(VIDEO_PATH).get(cv2.CAP_PROP_FPS) or 20
 
-    # =========================================================
     # 3️⃣ EXPLAINABILITY
-    # =========================================================
-    print("\n🔹 Generating Explainability Outputs...")
-
     gradcam = ActionGradCAM(ACTION_MODEL_PATH)
     cam_maps, _ = gradcam.generate(VIDEO_PATH)
-
-    gradcam_video_path = os.path.join(
-        OUTPUT_DIR, "gradcam_video.mp4"
-    )
-    save_gradcam_video(
-        VIDEO_PATH,
-        cam_maps,
-        gradcam_video_path
-    )
-
-    print("   ✓ Grad-CAM video saved")
+    save_gradcam_video(VIDEO_PATH, cam_maps, os.path.join(OUTPUT_DIR, "gradcam_video.mp4"))
 
     activation_explainer = ActivationMapExplainer(ACTION_MODEL_PATH)
     activation_maps = activation_explainer.generate(VIDEO_PATH)
+    save_activation_video(VIDEO_PATH, activation_maps, os.path.join(OUTPUT_DIR, "activation_video.mp4"))
 
-    activation_video_path = os.path.join(
-        OUTPUT_DIR, "activation_video.mp4"
-    )
-    save_activation_video(
-        VIDEO_PATH,
-        activation_maps,
-        activation_video_path
-    )
-
-    print("   ✓ Activation map video saved")
-
-    # =========================================================
-    # 4️⃣ CAPTIONING (GIT + BART FUSION)
-    # =========================================================
-    print("\n🔹 Generating Captions...")
-
-    keyframes = select_keyframes(
-        VIDEO_PATH,
-        anomaly_scores,
-        top_k=5
-    )
-
+    # 4️⃣ CAPTIONING
     captioner = SceneCaptioner(device=DEVICE)
+    keyframes = []
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        keyframes.append(frame)
+    cap.release()
 
-    # Step 1: Frame-level captions (GIT)
+    keyframes = keyframes[::max(len(keyframes)//5, 1)]
     frame_captions = captioner.caption_video_frames(keyframes)
 
-    # Step 2: Fuse captions (BART)
     final_caption = captioner.build_final_caption(
         frame_captions,
         action_label=action_result["action"],
         action_confidence=action_result["confidence"]
     )
 
-    # Step 3: Save captions
-    save_captions(
-        {
-            "frame_captions": frame_captions,
-            "final_caption": final_caption
-        },
-        os.path.join(OUTPUT_DIR, "captions.json")
+    # 5️⃣ TIMELINE
+    timeline = build_timeline(
+        anomaly_scores,
+        fps,
+        action_result["action"],
+        action_result["confidence"]
     )
 
-    print(f"   Caption: {final_caption}")
+    # 6️⃣ ALERTS
+    alerts = []
+    for e in timeline:
+        if e.get("max_score", 0) > 0.8:
+            alerts.append("🚨 High anomaly detected")
 
-    # =========================================================
-    # 5️⃣ FINAL REPORT
-    # =========================================================
-    print("\n🔹 Saving Final Report...")
-
+    # 7️⃣ REPORT EXPORT
     report = {
-        "video": VIDEO_PATH,
         "action_recognition": action_result,
         "anomaly": {
             "max_score": float(anomaly_scores.max()),
             "mean_score": float(anomaly_scores.mean())
         },
         "caption": final_caption,
+        "timeline": timeline,
+        "alerts": alerts,
         "outputs": {
-            "anomaly_scores": "output/anomaly_scores.npy",
-            "gradcam_video": "output/gradcam_video.mp4",
-            "activation_video": "output/activation_video.mp4"
+            "gradcam_video": "/output/gradcam_video.mp4",
+            "activation_video": "/output/activation_video.mp4"
         }
     }
 
-    report_path = os.path.join(
-        OUTPUT_DIR, "final_report.json"
-    )
-
-    with open(report_path, "w") as f:
+    with open(os.path.join(OUTPUT_DIR, "final_report.json"), "w") as f:
         json.dump(report, f, indent=2)
 
-    print("   ✓ Final report saved")
-    print("\n✅ Pipeline completed successfully!\n")
+    export_csv(timeline, os.path.join(OUTPUT_DIR, "events.csv"))
+    export_pdf(report, os.path.join(OUTPUT_DIR, "report.pdf"))
+
+    return report
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        VIDEO_PATH = sys.argv[1]
-    main()
+    VIDEO_PATH = sys.argv[1]
+    main(VIDEO_PATH)

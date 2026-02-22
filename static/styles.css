@@ -60,3 +60,21 @@ video {
     border-radius: 10px;
     margin-top: 10px;
 }
+
+.download-btn {
+    display: inline-block;
+    margin-right: 15px;
+    padding: 10px 15px;
+    background-color: #16a34a;
+    color: white;
+    text-decoration: none;
+    border-radius: 6px;
+}
+
+.download-btn:hover {
+    background-color: #15803d;
+}
+
+ul {
+    padding-left: 20px;
+}
